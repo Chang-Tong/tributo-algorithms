@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -254,6 +255,8 @@ def test_xlearner_treatment_validation_rejects_missing_column() -> None:
         _validate_treatment_batch(
             pd.DataFrame({"outcome": [1.0]}), treatment_name="treatment"
         )
+
+
 class _Booster:
     def __init__(self, values: list[float]) -> None:
         self.values = np.asarray(values, dtype=np.float32)
@@ -496,6 +499,10 @@ def test_xlearner_ordered_scan_is_linear_for_many_identical_physical_blocks() ->
 
 @pytest.mark.filterwarnings("ignore::FutureWarning")
 @pytest.mark.filterwarnings("ignore::ResourceWarning")
+@pytest.mark.skipif(
+    os.environ.get("TRIBUTO_REAL_RAY_TEST") != "1",
+    reason="requires an explicitly provisioned Ray worker runtime",
+)
 def test_xlearner_evaluation_handles_duplicate_keys_and_uneven_partitions() -> None:
     import random
     import tempfile
