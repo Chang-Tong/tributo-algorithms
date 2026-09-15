@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, cast
@@ -17,6 +16,12 @@ from tributo.algorithms.api import (
 from tributo.algorithms.spi import FrameworkNativeAlgorithm
 
 from tributo_algorithms_boosting.data_config import CompleteCoverageDataConfig
+from tributo_algorithms_boosting.training import (
+    _DEFAULT_BATCH_ROWS,
+    _xgboost_train_loop,
+)
+
+_train_loop = _xgboost_train_loop
 
 
 class _EvidenceCollector:
@@ -33,85 +38,6 @@ class _EvidenceCollector:
 
     def snapshot(self) -> list[dict[str, object]]:
         return [self.records[rank] for rank in sorted(self.records)]
-
-
-def _train_loop(config: dict[str, Any]) -> None:
-    import ray
-    import xgboost
-    from ray import train
-    from ray.train import Checkpoint
-
-    shard = train.get_dataset_shard("train")
-    frame = shard.materialize().to_pandas()
-    feature_names = list(config["feature_names"])
-    label_name = str(config["label_name"])
-    if frame.empty:
-        raise AlgorithmExecutionError("XGBoost Worker shard is empty")
-    dtrain = xgboost.DMatrix(
-        frame[feature_names].to_numpy(),
-        label=frame[label_name].to_numpy(),
-    )
-    context = train.get_context()
-    rank = context.get_world_rank()
-    world_size = context.get_world_size()
-    evidence_actor = config["evidence_actor"]
-
-    class EvidenceCheckpointCallback(xgboost.callback.TrainingCallback):
-        def after_training(self, model: object) -> object:
-            booster = cast(Any, model)
-            raw = bytes(booster.save_raw(raw_format="ubj"))
-            digest = hashlib.sha256(raw).hexdigest()
-            runtime = ray.get_runtime_context()
-            assigned = runtime.get_assigned_resources()
-            evidence = {
-                "worker_id": str(runtime.get_worker_id()),
-                "node_id": str(runtime.get_node_id()),
-                "rank": rank,
-                "world_size": world_size,
-                "shard_id": hashlib.sha256(
-                    f"{config['binding_digest']}:{rank}/{world_size}".encode("ascii")
-                ).hexdigest(),
-                "rows_processed": int(frame.shape[0]),
-                "input_rows": {"train": int(frame.shape[0])},
-                "batch_count": int(config["num_boost_round"]),
-                "collective_steps": int(config["num_boost_round"]),
-                "model_state_digest": digest,
-                "resources": {
-                    "num_cpus": float(assigned.get("CPU", 0.0)),
-                    "num_gpus": float(assigned.get("GPU", 0.0)),
-                    "custom": {
-                        str(name): float(value)
-                        for name, value in assigned.items()
-                        if name not in {"CPU", "GPU", "memory", "object_store_memory"}
-                    },
-                },
-            }
-            ray.get(evidence_actor.record.remote(evidence))
-            if rank == 0:
-                with tempfile.TemporaryDirectory(
-                    prefix="tributo-xgboost-"
-                ) as directory:
-                    root = Path(directory)
-                    booster.save_model(root / "model.ubj")
-                    (root / "feature_names.json").write_text(
-                        __import__("json").dumps(feature_names), encoding="utf-8"
-                    )
-                    train.report(
-                        {"model_state_digest": digest},
-                        checkpoint=Checkpoint.from_directory(root),
-                    )
-            else:
-                train.report({"model_state_digest": digest})
-            return model
-
-    xgboost.train(
-        dict(config["params"]),
-        dtrain,
-        num_boost_round=int(config["num_boost_round"]),
-        evals=[(dtrain, "train")],
-        verbose_eval=False,
-        callbacks=[EvidenceCheckpointCallback()],
-    )
 
 
 class DistributedXGBoost(FrameworkNativeAlgorithm):
@@ -180,7 +106,8 @@ class DistributedXGBoost(FrameworkNativeAlgorithm):
                 "feature_names": list(binding.feature_names),
                 "label_name": str(data["label_col"]),
                 "params": model,
-                "num_boost_round": int(training.get("num_rounds", 10)),
+                "num_rounds": int(training.get("num_rounds", 10)),
+                "batch_rows": int(training.get("batch_rows", _DEFAULT_BATCH_ROWS)),
                 "evidence_actor": self.collector,
                 "binding_digest": self.plan.primary_input_descriptor.binding_digest,
             },

@@ -3167,6 +3167,7 @@ source = { editable = "packages/boosting" }
 dependencies = [
     { name = "lightgbm" },
     { name = "onnxmltools" },
+    { name = "scikit-learn" },
     { name = "tributo", extra = ["model-export"] },
     { name = "xgboost" },
 ]
@@ -3175,6 +3176,7 @@ dependencies = [
 requires-dist = [
     { name = "lightgbm", specifier = ">=4.5,<5" },
     { name = "onnxmltools", specifier = ">=1.13" },
+    { name = "scikit-learn", specifier = ">=1.5,<2" },
     { name = "tributo", extras = ["model-export"], editable = "../../Tributo" },
     { name = "xgboost", specifier = ">=2.1,<4" },
 ]

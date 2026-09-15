@@ -9,6 +9,7 @@ dependencies = [
     "lightgbm>=4.5,<5",
     "xgboost>=2.1,<4",
     "onnxmltools>=1.13",
+    "scikit-learn>=1.5,<2",
 ]
 
 [project.entry-points."tributo.algorithms"]

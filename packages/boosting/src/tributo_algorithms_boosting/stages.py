@@ -83,7 +83,7 @@ class XGBoostStageRunner:
                     "feature_names": list(feature_names),
                     "label_name": label_name,
                     "params": dict(params),
-                    "num_boost_round": num_boost_round,
+                    "num_rounds": num_boost_round,
                     "evidence_actor": collector,
                     "binding_digest": stage_digest,
                 },
