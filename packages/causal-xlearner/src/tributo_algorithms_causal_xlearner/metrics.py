@@ -415,11 +415,15 @@ def evaluate_xlearner_dataset(
     )
     scan_rows = cast(
         list[Mapping[str, object]],
+        # The scan is a lightweight NumPy reduction. A fractional reservation
+        # leaves capacity for Ray Data's input operator on small clusters while
+        # the fixed one-actor pool preserves global prefix order.
         scored.map_batches(
             _OrderedMetricScan,
             batch_format="pandas",
             batch_size=None,
             compute=ActorPoolStrategy(size=1),
+            num_cpus=0.5,
             fn_constructor_kwargs={"target_ranks": sorted(target_ranks)},
             max_concurrency=1,
             allow_out_of_order_execution=False,
