@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 from collections.abc import Mapping
 from typing import Any, cast
 
@@ -53,10 +51,45 @@ _PREFIX_FIELDS = (
     "control_outcome_sum",
 )
 
-
-def _python_scalar(value: object) -> object:
-    item = getattr(value, "item", None)
-    return item() if callable(item) else value
+# Hash every value that affects the report into a stable, non-semantic
+# tie-breaker. Exact duplicates remain interchangeable because they contribute
+# identical values to every metric.
+_TIE_BREAK_COLUMNS = (
+    CATE_COLUMN,
+    IDENTITY_COLUMN,
+    TREATMENT_COLUMN,
+    OUTCOME_COLUMN,
+    CONTRIBUTION_COLUMN,
+    QUADRANT_COLUMN,
+)
+_TIE_BREAKER_HIGH_COLUMN = "__tributo_xlearner_tie_breaker_high"
+_TIE_BREAKER_LOW_COLUMN = "__tributo_xlearner_tie_breaker_low"
+_RECORD_TYPE_COLUMN = "__tributo_xlearner_metric_record_type"
+_SUMMARY_RECORD = "summary"
+_PREFIX_RECORD = "prefix"
+_SUMMARY_ONLY_FIELDS = (
+    "count",
+    "positive_contribution_count",
+    "zero_contribution_count",
+    "negative_contribution_count",
+    *(
+        f"quadrant.{name}.{field}"
+        for name in QUADRANT_ORDER
+        for field in (
+            "count",
+            "treated_count",
+            "control_count",
+            "treated_outcome_sum",
+            "control_outcome_sum",
+        )
+    ),
+)
+_SCAN_COLUMNS = (
+    _RECORD_TYPE_COLUMN,
+    "rank",
+    *_PREFIX_FIELDS,
+    *_SUMMARY_ONLY_FIELDS,
+)
 
 
 def _as_int(value: object) -> int:
@@ -67,34 +100,29 @@ def _as_float(value: object) -> float:
     return float(cast(Any, value))
 
 
-def _block_key(frame: Any) -> str:
-    first = frame.iloc[0]
-    last = frame.iloc[-1]
-    payload = (
-        _python_scalar(first[CATE_COLUMN]),
-        _python_scalar(first[IDENTITY_COLUMN]),
-        _python_scalar(last[CATE_COLUMN]),
-        _python_scalar(last[IDENTITY_COLUMN]),
-        int(len(frame)),
-    )
-    return hashlib.sha256(
-        json.dumps(payload, default=str, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
-
-
-def _summary_batch(batch: object) -> object:
+def _attach_stable_tie_breaker(batch: object) -> object:
     import pandas as pd
 
     frame = cast(Any, batch)
-    if frame.empty:
-        return pd.DataFrame()
+    result = frame.copy(deep=False)
+    result[_TIE_BREAKER_HIGH_COLUMN] = pd.util.hash_pandas_object(
+        frame.loc[:, list(_TIE_BREAK_COLUMNS)],
+        index=False,
+        categorize=False,
+    ).to_numpy(dtype=np.uint64, copy=False)
+    result[_TIE_BREAKER_LOW_COLUMN] = pd.util.hash_pandas_object(
+        frame.loc[:, list(reversed(_TIE_BREAK_COLUMNS))],
+        index=False,
+        categorize=False,
+    ).to_numpy(dtype=np.uint64, copy=False)
+    return result
+
+
+def _summarize_batch(frame: Any) -> dict[str, object]:
     treatment = frame[TREATMENT_COLUMN].to_numpy(dtype=np.int8)
     outcome = frame[OUTCOME_COLUMN].to_numpy(dtype=np.float64)
     contribution = frame[CONTRIBUTION_COLUMN].to_numpy(dtype=np.float64)
     row: dict[str, object] = {
-        "block_key": _block_key(frame),
-        "first_cate": float(frame[CATE_COLUMN].iloc[0]),
-        "first_identity": _python_scalar(frame[IDENTITY_COLUMN].iloc[0]),
         "count": int(len(frame)),
         "gain": float(contribution.sum()),
         "cate_sum": float(frame[CATE_COLUMN].sum()),
@@ -116,42 +144,15 @@ def _summary_batch(batch: object) -> object:
         row[f"quadrant.{name}.control_count"] = int(control_mask.sum())
         row[f"quadrant.{name}.treated_outcome_sum"] = float(outcome[treated_mask].sum())
         row[f"quadrant.{name}.control_outcome_sum"] = float(outcome[control_mask].sum())
-    return pd.DataFrame([row])
+    return row
 
 
-def _identity_sort_key(value: object) -> tuple[int, object]:
-    value = _python_scalar(value)
-    if isinstance(value, (int, np.integer)) and not isinstance(value, bool):
-        return (0, int(value))
-    if isinstance(value, (float, np.floating)):
-        return (1, float(value))
-    if isinstance(value, bytes):
-        return (2, value)
-    return (3, str(value))
-
-
-def _prefix_batch(
-    batch: object,
-    *,
-    plans: Mapping[str, Mapping[str, object]],
-) -> object:
-    import pandas as pd
-
-    frame = cast(Any, batch)
-    columns = ("rank", *_PREFIX_FIELDS)
-    if frame.empty:
-        return pd.DataFrame({name: [] for name in columns})
-    plan = plans.get(_block_key(frame))
-    if plan is None:
-        return pd.DataFrame({name: [] for name in columns})
-
-    targets = tuple(_as_int(value) for value in cast(list[object], plan["local_ranks"]))
-    base_rank = _as_int(plan["base_rank"])
+def _local_prefixes(frame: Any) -> dict[str, np.ndarray[Any, Any]]:
     contribution = frame[CONTRIBUTION_COLUMN].to_numpy(dtype=np.float64)
     cate = frame[CATE_COLUMN].to_numpy(dtype=np.float64)
     treatment = frame[TREATMENT_COLUMN].to_numpy(dtype=np.int8)
     outcome = frame[OUTCOME_COLUMN].to_numpy(dtype=np.float64)
-    prefixes = {
+    return {
         "gain": np.cumsum(contribution),
         "cate_sum": np.cumsum(cate),
         "treated_count": np.cumsum(treatment == 1),
@@ -159,15 +160,57 @@ def _prefix_batch(
         "treated_outcome_sum": np.cumsum(outcome * (treatment == 1)),
         "control_outcome_sum": np.cumsum(outcome * (treatment == 0)),
     }
-    result: dict[str, list[object]] = {name: [] for name in columns}
-    for local_rank in targets:
-        index = local_rank - 1
-        result["rank"].append(base_rank + local_rank)
-        for field in _PREFIX_FIELDS:
-            result[field].append(
-                _as_float(plan[f"base_{field}"]) + prefixes[field][index]
+
+
+def _empty_scan_record(record_type: str, rank: int = 0) -> dict[str, object]:
+    record: dict[str, object] = dict.fromkeys(_SCAN_COLUMNS, 0.0)
+    record[_RECORD_TYPE_COLUMN] = record_type
+    record["rank"] = rank
+    return record
+
+
+class _OrderedMetricScan:
+    """Single-actor prefix scan over an already sorted Ray Dataset."""
+
+    def __init__(self, *, target_ranks: list[int]) -> None:
+        self._target_ranks = tuple(sorted(target_ranks))
+        self._base_rank = 0
+        self._base_values: dict[str, float] = dict.fromkeys(_PREFIX_FIELDS, 0.0)
+
+    def __call__(self, batch: object) -> object:
+        import pandas as pd
+
+        frame = cast(Any, batch)
+        if frame.empty:
+            return pd.DataFrame(columns=_SCAN_COLUMNS)
+
+        summary = _summarize_batch(frame)
+        summary_record = _empty_scan_record(_SUMMARY_RECORD)
+        summary_record.update(summary)
+        records = [summary_record]
+
+        end_rank = self._base_rank + len(frame)
+        local_ranks = (
+            rank - self._base_rank
+            for rank in self._target_ranks
+            if self._base_rank < rank <= end_rank
+        )
+        prefixes = _local_prefixes(frame)
+        for local_rank in local_ranks:
+            prefix_record = _empty_scan_record(
+                _PREFIX_RECORD,
+                self._base_rank + local_rank,
             )
-    return pd.DataFrame(result)
+            for field in _PREFIX_FIELDS:
+                prefix_record[field] = (
+                    self._base_values[field] + prefixes[field][local_rank - 1]
+                )
+            records.append(prefix_record)
+
+        self._base_rank = end_rank
+        for field in _PREFIX_FIELDS:
+            self._base_values[field] += _as_float(summary[field])
+        return pd.DataFrame.from_records(records, columns=_SCAN_COLUMNS)
 
 
 def _area(values: list[float]) -> float:
@@ -332,36 +375,17 @@ def evaluate_xlearner_dataset(
 ) -> Mapping[str, object]:
     """Evaluate cross-fitted predictions with distributed sorting and reductions.
 
-    Only one bounded record per Ray block and the requested curve/calibration
-    prefixes are returned to the Driver. Prediction rows remain in Ray's object
-    store and spill layer.
+    One summary per Ray block and one prefix per requested rank are returned to
+    the Driver, so coordinator memory is O(blocks + requested ranks). The scan
+    actor holds only the current block and its cumulative scalars; prediction
+    rows remain in Ray's object store and spill layer.
     """
     if rows < 1 or treated_rows < 1 or control_rows < 1:
         raise ValueError("X-Learner evaluation requires both treatment groups")
     if n_points < 2 or n_bins < 1:
         raise ValueError("invalid X-Learner evaluation resolution")
 
-    scored = (
-        cast(Any, dataset)
-        .sort([CATE_COLUMN, IDENTITY_COLUMN], descending=[True, False])
-        .materialize()
-    )
-    summaries = cast(
-        list[Mapping[str, object]],
-        scored.map_batches(
-            _summary_batch,
-            batch_format="pandas",
-            batch_size=None,
-        ).take_all(),
-    )
-    if not summaries or sum(_as_int(item["count"]) for item in summaries) != rows:
-        raise RuntimeError("X-Learner metric reduction lost prediction rows")
-    summaries.sort(
-        key=lambda item: (
-            -_as_float(item["first_cate"]),
-            _identity_sort_key(item["first_identity"]),
-        )
-    )
+    from ray.data import ActorPoolStrategy
 
     x_axis = [index / (n_points - 1) for index in range(n_points)]
     target_ranks = {int(rows * value) for value in x_axis}
@@ -371,39 +395,49 @@ def evaluate_xlearner_dataset(
     target_ranks.update(rows - value for value in ascending_bounds)
     target_ranks.discard(0)
 
-    plans: dict[str, dict[str, object]] = {}
-    base_rank = 0
-    base_values: dict[str, float] = dict.fromkeys(_PREFIX_FIELDS, 0.0)
-    for summary in summaries:
-        count = _as_int(summary["count"])
-        local_ranks = sorted(
-            rank - base_rank
-            for rank in target_ranks
-            if base_rank < rank <= base_rank + count
-        )
-        plans[str(summary["block_key"])] = {
-            "base_rank": base_rank,
-            "local_ranks": local_ranks,
-            **{f"base_{field}": base_values[field] for field in _PREFIX_FIELDS},
-        }
-        base_rank += count
-        for field in _PREFIX_FIELDS:
-            base_values[field] += _as_float(summary[field])
-
-    prefix_rows = cast(
-        list[Mapping[str, object]],
-        scored.map_batches(
-            _prefix_batch,
+    scored = (
+        cast(Any, dataset)
+        .map_batches(
+            _attach_stable_tie_breaker,
             batch_format="pandas",
             batch_size=None,
-            fn_kwargs={"plans": plans},
+        )
+        .sort(
+            [
+                CATE_COLUMN,
+                IDENTITY_COLUMN,
+                _TIE_BREAKER_HIGH_COLUMN,
+                _TIE_BREAKER_LOW_COLUMN,
+            ],
+            descending=[True, False, False, False],
+        )
+        .materialize()
+    )
+    scan_rows = cast(
+        list[Mapping[str, object]],
+        scored.map_batches(
+            _OrderedMetricScan,
+            batch_format="pandas",
+            batch_size=None,
+            compute=ActorPoolStrategy(size=1),
+            fn_constructor_kwargs={"target_ranks": sorted(target_ranks)},
+            max_concurrency=1,
+            allow_out_of_order_execution=False,
+            max_restarts=0,
+            max_task_retries=0,
         ).take_all(),
     )
+    summaries = [
+        item for item in scan_rows if item[_RECORD_TYPE_COLUMN] == _SUMMARY_RECORD
+    ]
+    if not summaries or sum(_as_int(item["count"]) for item in summaries) != rows:
+        raise RuntimeError("X-Learner metric reduction lost prediction rows")
     prefixes = {
         _as_int(item["rank"]): {
             field: _as_float(item[field]) for field in _PREFIX_FIELDS
         }
-        for item in prefix_rows
+        for item in scan_rows
+        if item[_RECORD_TYPE_COLUMN] == _PREFIX_RECORD
     }
     if set(prefixes) != target_ranks:
         raise RuntimeError("X-Learner metric reduction missed requested prefixes")
