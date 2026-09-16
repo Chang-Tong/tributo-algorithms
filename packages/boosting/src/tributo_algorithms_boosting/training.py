@@ -438,7 +438,7 @@ def _split_dataset(
     if strategy not in {"RANDOM", "TIME_ORDERED"}:
         raise ValueError("training.split_strategy must be RANDOM or TIME_ORDERED")
     source = (
-        dataset.random_shuffle(seed=int(training.get("seed", 42)))
+        dataset.randomize_block_order(seed=int(training.get("seed", 42)))
         if strategy == "RANDOM"
         else dataset
     )

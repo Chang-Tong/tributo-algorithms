@@ -21,7 +21,7 @@ class _Dataset:
     def count(self) -> int:
         return self.rows
 
-    def random_shuffle(self, seed: int) -> _Dataset:
+    def randomize_block_order(self, *, seed: int) -> _Dataset:
         self.random_seed = seed
         return self
 
@@ -126,6 +126,7 @@ def test_split_dataset_preserves_all_three_way_rows() -> None:
     )
 
     assert dataset.random_seed == 42
+    assert "random_shuffle" not in inspect.getsource(runtime._split_dataset)
     assert rows == {
         "total": 3_000_000,
         "train": 2_100_000,
