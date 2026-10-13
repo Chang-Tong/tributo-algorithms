@@ -3255,7 +3255,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "dowhy", specifier = ">=0.13,<0.15" },
+    { name = "dowhy", specifier = ">=0.14,<0.15" },
     { name = "networkx", specifier = ">=3.0" },
     { name = "numpy", specifier = ">=2,<3" },
     { name = "onnx", specifier = ">=1.16" },

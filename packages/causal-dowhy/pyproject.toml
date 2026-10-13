@@ -7,7 +7,7 @@ license = { text = "Apache-2.0" }
 dependencies = [
     "tributo>=1,<2",
     "tributo-algorithms-causal-core==0.1.0",
-    "dowhy>=0.13,<0.15",
+    "dowhy>=0.14,<0.15",
     "networkx>=3.0",
     "numpy>=2,<3",
     "onnx>=1.16",

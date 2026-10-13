@@ -113,6 +113,33 @@ def test_workflows_use_the_portable_nested_checkout_layout() -> None:
     assert "packages-dir: workspace/tributo-algorithms/dist/" in release
 
 
+def test_ci_checks_python_matrix_and_independent_algorithm_wheels() -> None:
+    ci = (_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    dowhy_project = (_ROOT / "packages" / "causal-dowhy" / "pyproject.toml").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'python-version: ["3.12", "3.13"]' in ci
+    assert "python-version: ${{ matrix.python-version }}" in ci
+    assert "Verify source-free Wheels for XGBoost and causal algorithms" in ci
+    assert '"dowhy>=0.14,<0.15"' in dowhy_project
+
+    expected_distributions = {
+        "tributo-algorithms-boosting": 2,
+        "tributo-algorithms-causal-core": 3,
+        "tributo-algorithms-causal-discovery": 1,
+        "tributo-algorithms-causal-dr": 1,
+        "tributo-algorithms-causal-xlearner": 1,
+        "tributo-algorithms-causal-dowhy": 2,
+    }
+    for distribution, entry_point_count in expected_distributions.items():
+        assert distribution in ci
+        assert (
+            f"--distribution {distribution} --expected-entry-points {entry_point_count}"
+            in ci
+        )
+
+
 def test_source_free_verifier_exercises_scalar_binding_contract() -> None:
     verifier = _verifier_module()
 
