@@ -108,7 +108,9 @@ def test_worker_batches_preserve_rows_order_checkpoint_and_evidence(
 ) -> None:
     frame = _frame()
     shard, evidence, reports = _worker(monkeypatch, tmp_path, frame)
-    algorithm._train_loop(_config(evidence))
+    config = _config(evidence)
+    config["params"]["min_child_weight"] = 0
+    algorithm._train_loop(config)
 
     assert shard is not None
     assert shard.calls
@@ -134,8 +136,12 @@ def test_worker_batches_preserve_rows_order_checkpoint_and_evidence(
     restored = xgboost.Booster()
     restored.load_model(bytearray(checkpoint["model"]))
     matrix = xgboost.DMatrix(frame[["b", "a"]].to_numpy(), label=frame["label"])
-    baseline = xgboost.train(_config(evidence)["params"], matrix, num_boost_round=3)
-    np.testing.assert_allclose(restored.predict(matrix), baseline.predict(matrix))
+    baseline = xgboost.train(config["params"], matrix, num_boost_round=3)
+    predictions = restored.predict(matrix)
+    assert np.ptp(predictions) > 0
+    np.testing.assert_allclose(predictions, baseline.predict(matrix))
+    swapped = xgboost.DMatrix(frame[["a", "b"]].to_numpy())
+    assert not np.allclose(predictions, restored.predict(swapped))
     assert list(tmp_path.iterdir()) == []
 
 
