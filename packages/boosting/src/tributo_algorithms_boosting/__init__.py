@@ -19,14 +19,6 @@ _LAZY_EXPORTS = {
     ),
     "XGBoostStageResult": ("tributo_algorithms_boosting.stages", "XGBoostStageResult"),
     "XGBoostStageRunner": ("tributo_algorithms_boosting.stages", "XGBoostStageRunner"),
-    "TrainingReporter": (
-        "tributo_algorithms_boosting.training",
-        "TrainingReporter",
-    ),
-    "run_xgboost_training": (
-        "tributo_algorithms_boosting.training",
-        "run_xgboost_training",
-    ),
 }
 
 
@@ -44,9 +36,7 @@ def __getattr__(name: str) -> Any:
 __all__ = [
     "DistributedXGBoost",
     "LIGHTGBM_DESCRIPTOR",
-    "TrainingReporter",
     "XGBOOST_DESCRIPTOR",
     "XGBoostStageResult",
     "XGBoostStageRunner",
-    "run_xgboost_training",
 ]

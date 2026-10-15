@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, cast
@@ -16,12 +17,8 @@ from tributo.algorithms.api import (
 from tributo.algorithms.spi import FrameworkNativeAlgorithm
 
 from tributo_algorithms_boosting.data_config import CompleteCoverageDataConfig
-from tributo_algorithms_boosting.training import (
-    _DEFAULT_BATCH_ROWS,
-    _xgboost_train_loop,
-)
 
-_train_loop = _xgboost_train_loop
+_XGBOOST_BATCH_ROWS = 65_536
 
 
 class _EvidenceCollector:
@@ -38,6 +35,122 @@ class _EvidenceCollector:
 
     def snapshot(self) -> list[dict[str, object]]:
         return [self.records[rank] for rank in sorted(self.records)]
+
+
+def _train_loop(config: dict[str, Any]) -> None:
+    import gc
+    import json
+
+    import ray
+    import xgboost
+    from ray import train
+    from ray.train import Checkpoint
+
+    feature_names = list(config["feature_names"])
+    label_name = str(config["label_name"])
+    rounds = config["num_boost_round"]
+    if not isinstance(rounds, int) or isinstance(rounds, bool) or rounds < 1:
+        raise AlgorithmExecutionError("XGBoost num_boost_round must be positive")
+
+    class ShardDataIter(xgboost.DataIter):
+        def __init__(self, cache_prefix: str) -> None:
+            super().__init__(cache_prefix=cache_prefix, release_data=True)
+            self.iterator: Any = None
+            self.has_rows = False
+
+        def reset(self) -> None:
+            self.has_rows = False
+            shard = train.get_dataset_shard("train")
+            if shard is None:
+                raise AlgorithmExecutionError("XGBoost train shard is missing")
+            self.iterator = iter(
+                shard.iter_batches(
+                    batch_format="pandas",
+                    batch_size=_XGBOOST_BATCH_ROWS,
+                    prefetch_batches=1,
+                )
+            )
+
+        def next(self, input_data: Any) -> bool:
+            if self.iterator is None:
+                self.reset()
+            for frame in self.iterator:
+                if not frame.empty:
+                    self.has_rows = True
+                    input_data(
+                        data=frame[feature_names].to_numpy(),
+                        label=frame[label_name].to_numpy(),
+                    )
+                    return True
+            if not self.has_rows:
+                raise AlgorithmExecutionError("XGBoost Worker shard is empty")
+            return False
+
+    context = train.get_context()
+    rank = context.get_world_rank()
+    world_size = context.get_world_size()
+    evidence_actor = config["evidence_actor"]
+
+    with tempfile.TemporaryDirectory(prefix="tributo-xgboost-pages-") as cache_root:
+        iterator = ShardDataIter(str(Path(cache_root) / "train"))
+        dtrain = None
+        try:
+            dtrain = xgboost.DMatrix(iterator)
+            rows_processed = int(dtrain.num_row())
+            if rows_processed < 1:
+                raise AlgorithmExecutionError("XGBoost Worker shard is empty")
+            booster = xgboost.train(
+                dict(config["params"]),
+                dtrain,
+                num_boost_round=rounds,
+                evals=[(dtrain, "train")],
+                verbose_eval=False,
+            )
+            actual_rounds = int(booster.num_boosted_rounds())
+        finally:
+            # DMatrix owns external-memory pages. Release it before its cache directory.
+            del dtrain, iterator
+            gc.collect()
+
+    raw = bytes(booster.save_raw(raw_format="ubj"))
+    digest = hashlib.sha256(raw).hexdigest()
+    runtime = ray.get_runtime_context()
+    assigned = runtime.get_assigned_resources()
+    evidence = {
+        "worker_id": str(runtime.get_worker_id()),
+        "node_id": str(runtime.get_node_id()),
+        "rank": rank,
+        "world_size": world_size,
+        "shard_id": hashlib.sha256(
+            f"{config['binding_digest']}:{rank}/{world_size}".encode("ascii")
+        ).hexdigest(),
+        "rows_processed": rows_processed,
+        "input_rows": {"train": rows_processed},
+        "batch_count": actual_rounds,
+        "collective_steps": actual_rounds,
+        "model_state_digest": digest,
+        "resources": {
+            "num_cpus": float(assigned.get("CPU", 0.0)),
+            "num_gpus": float(assigned.get("GPU", 0.0)),
+            "custom": {
+                str(name): float(value)
+                for name, value in assigned.items()
+                if name not in {"CPU", "GPU", "memory", "object_store_memory"}
+            },
+        },
+    }
+    ray.get(evidence_actor.record.remote(evidence))
+    metrics = {"model_state_digest": digest, "training_rounds": actual_rounds}
+    if rank == 0:
+        with tempfile.TemporaryDirectory(prefix="tributo-xgboost-") as directory:
+            root = Path(directory)
+            booster.save_model(root / "model.ubj")
+            (root / "feature_names.json").write_text(
+                json.dumps(feature_names), encoding="utf-8"
+            )
+            train.report(metrics, checkpoint=Checkpoint.from_directory(root))
+    else:
+        train.report(metrics)
 
 
 class DistributedXGBoost(FrameworkNativeAlgorithm):
@@ -106,8 +219,7 @@ class DistributedXGBoost(FrameworkNativeAlgorithm):
                 "feature_names": list(binding.feature_names),
                 "label_name": str(data["label_col"]),
                 "params": model,
-                "num_rounds": int(training.get("num_rounds", 10)),
-                "batch_rows": int(training.get("batch_rows", _DEFAULT_BATCH_ROWS)),
+                "num_boost_round": int(training.get("num_rounds", 10)),
                 "evidence_actor": self.collector,
                 "binding_digest": self.plan.primary_input_descriptor.binding_digest,
             },
@@ -255,7 +367,7 @@ def export_result(
                 "framework": "xgboost",
                 "framework_versions": {"xgboost": xgboost.__version__},
                 "objective": objective,
-                "producer_distribution": "tributo-algorithms-boosting",
+                "producer_distribution": "tributo-algorithms",
             },
             source_fingerprint=source_fingerprint,
             checkpoint_contract=checkpoint_contract,
